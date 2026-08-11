@@ -3,6 +3,8 @@ package io.music_assistant.client.auth
 import co.touchlab.kermit.Logger
 import io.music_assistant.client.api.Request
 import io.music_assistant.client.api.ServiceClient
+import io.music_assistant.client.data.CarPlayContinuityCoordinator
+import io.music_assistant.client.data.ContinuityInvalidation
 import io.music_assistant.client.data.model.server.AuthProvider
 import io.music_assistant.client.data.model.server.OauthUrl
 import io.music_assistant.client.data.model.server.User
@@ -37,6 +39,7 @@ private val log = Logger.withTag("AuthMgr")
 class AuthenticationManager(
     private val serviceClient: ServiceClient,
     private val settings: SettingsRepository,
+    private val carPlayContinuity: CarPlayContinuityCoordinator? = null,
 ) : AuthCoordinator {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
@@ -314,6 +317,7 @@ class AuthenticationManager(
 
     override suspend fun logout(): Result<Unit> {
         return try {
+            carPlayContinuity?.invalidate(ContinuityInvalidation.Logout)
             // Set flag FIRST, before any async operations
             _isLoggingOut.value = true
             val currentState = serviceClient.sessionState.value

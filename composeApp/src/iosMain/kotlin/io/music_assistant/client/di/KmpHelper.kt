@@ -12,6 +12,9 @@ import io.music_assistant.client.api.Request
 import io.music_assistant.client.api.ServiceClient
 import io.music_assistant.client.auth.AuthenticationManager
 import io.music_assistant.client.carplay.CarPlayStrings
+import io.music_assistant.client.data.CarPlayContinuityCoordinator
+import io.music_assistant.client.data.ContinuityInvalidation
+import io.music_assistant.client.data.LocalPlaybackIntentLane
 import io.music_assistant.client.data.MainDataSource
 import io.music_assistant.client.data.NowPlayingModes
 import io.music_assistant.client.data.NowPlayingTrack
@@ -34,6 +37,7 @@ import io.music_assistant.client.data.model.client.toItemKind
 import io.music_assistant.client.data.planLocalPlayerDispatch
 import io.music_assistant.client.data.repository.MediaItemRepository
 import io.music_assistant.client.input.VolumeButtonService
+import io.music_assistant.client.player.MediaPlayerController
 import io.music_assistant.client.settings.CarPlatform
 import io.music_assistant.client.settings.DefaultClickOption
 import io.music_assistant.client.settings.SettingsRepository
@@ -78,6 +82,9 @@ object KmpHelper : KoinComponent {
     private val deepLinkBus: DeepLinkBus by inject()
     private val mediaItemRepository: MediaItemRepository by inject()
     private val settingsRepository: SettingsRepository by inject()
+    private val carPlayContinuity: CarPlayContinuityCoordinator by inject()
+    private val mediaPlayerController: MediaPlayerController by inject()
+    private val playbackIntentLane: LocalPlaybackIntentLane by inject()
     private val volumeButtonService: VolumeButtonService by inject()
     private val artworkHttpClient: HttpClient by inject(named("webrtcHttpClient"))
 
@@ -122,8 +129,33 @@ object KmpHelper : KoinComponent {
     /** Whether the local player is enabled; CarPlay gates attachment on this. */
     fun isLocalPlayerEnabled(): Boolean = settingsRepository.sendspinEnabled.value
 
+    fun recordCarPlayRouteLossHold(wasInterrupted: Boolean, nativeGeneration: Long): Boolean {
+        val serverReportsPlaying = mainDataSource.localPlayer.value?.player?.isPlaying
+        val shouldPersist = io.music_assistant.client.data.shouldPersistCarPlayRouteLossHold(
+            serverReportsPlaying,
+            wasInterrupted,
+        )
+        return carPlayContinuity.recordRouteLossHold(
+            currentTimeMillis(),
+            nativeGeneration,
+            persistHold = shouldPersist,
+        )
+    }
+
+    fun hasRouteLossHold(): Boolean =
+        settingsRepository.loadCarPlayRouteLossHoldAt() != 0L
+
     fun onExternalConsumerActive() = serviceClient.onExternalConsumerActive()
     fun onExternalConsumerInactive() = serviceClient.onExternalConsumerInactive()
+
+    fun onCarPlayConnected(completion: (Long?) -> Unit) {
+        mainDataSource.onCarPlayConnected { ticket ->
+            mainScope.launch { completion(ticket) }
+        }
+    }
+    fun confirmCarPlayContinuity(ticket: Long, routeAvailable: Boolean, otherAudioOwner: Boolean) =
+        mainDataSource.confirmCarPlayContinuity(ticket, routeAvailable, otherAudioOwner)
+    fun onCarPlayDisconnected() = mainDataSource.onCarPlayDisconnected()
 
     // MARK: - Artwork loader (Swift-callable)
     //
@@ -445,12 +477,18 @@ object KmpHelper : KoinComponent {
             option = option,
             radioMode = radioMode,
         ) ?: return false
+        val nativeGeneration = mediaPlayerController.allowPlaybackAfterUserIntent()
+        if (nativeGeneration < 0L) return false
+        if (!carPlayContinuity.invalidate(ContinuityInvalidation.UserPlay, nativeGeneration)) return false
+        val playbackIntentGeneration = playbackIntentLane.issue()
         plan.detachFrom?.let { syncedToId ->
             log.i { "dispatchLocal($option, radio=$radioMode): detaching ${plan.playerId} from $syncedToId" }
         }
         mainScope.launch {
-            executeLocalPlayerDispatch(serviceClient, plan) { label, error ->
-                log.w(error) { "$label RPC failed: ${error.message}" }
+            playbackIntentLane.executeIfCurrent(playbackIntentGeneration) {
+                executeLocalPlayerDispatch(serviceClient, plan) { label, error ->
+                    log.w(error) { "$label RPC failed: ${error.message}" }
+                }
             }
         }
         return true

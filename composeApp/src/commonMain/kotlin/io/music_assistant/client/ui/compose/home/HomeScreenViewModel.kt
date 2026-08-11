@@ -376,9 +376,10 @@ class HomeScreenViewModel(
 
     fun selectPlayer(player: Player) = dataSource.selectPlayer(player)
     fun playerAction(playerId: String, action: PlayerAction) =
-        dataSource.playerAction(playerId, action)
+        dataSource.playerAction(playerId, action, explicitUserIntent = true)
 
-    fun playerAction(data: PlayerData, action: PlayerAction) = dataSource.playerAction(data, action)
+    fun playerAction(data: PlayerData, action: PlayerAction) =
+        dataSource.playerAction(data, action, explicitUserIntent = true)
     fun queueAction(action: QueueAction) = dataSource.queueAction(action)
     fun onPlayersSortChanged(newSort: List<String>) = dataSource.onPlayersSortChanged(newSort)
     fun openPlayerSettings(id: String) = settings.connectionInfo.value?.webUrl?.let { url ->

@@ -50,6 +50,7 @@ import io.music_assistant.client.ui.compose.common.icons.BookshelfIcon
 import io.music_assistant.client.ui.compose.common.providers.ProviderIconModel
 import io.music_assistant.client.utils.AuthProcessState
 import io.music_assistant.client.utils.DataConnectionState
+import io.music_assistant.client.utils.HasConnectionData
 import io.music_assistant.client.utils.SessionState
 import io.music_assistant.client.utils.currentTimeMillis
 import io.music_assistant.client.utils.resultAs
@@ -96,6 +97,7 @@ class MainDataSource(
     private val mediaItemFactory: MediaItemFactory,
     private val playerFactory: PlayerFactory,
     private val queueFactory: QueueFactory,
+    private val carPlayContinuity: CarPlayContinuityCoordinator,
 ) : CoroutineScope {
     private val log = Logger.withTag("MainDataSource")
 
@@ -480,6 +482,7 @@ class MainDataSource(
 
                             if (isTerminalAuthFailure) {
                                 // Auth permanently failed — stop everything
+                                carPlayContinuity.invalidate(ContinuityInvalidation.Stop)
                                 localPlayerController.stop(GoodbyeReason.Shutdown)
                                 clearAllData()
                             } else {
@@ -565,6 +568,7 @@ class MainDataSource(
                             SessionState.Disconnected.ByUser -> {
                                 // Intentional logout - clear everything
                                 log.i { "Disconnected by user - clearing all data" }
+                                carPlayContinuity.invalidate(ContinuityInvalidation.Stop)
                                 localPlayerController.stop(GoodbyeReason.UserRequest)
                                 clearAllData()
                                 updateJob?.cancel()
@@ -692,6 +696,9 @@ class MainDataSource(
         // Watch for Sendspin settings changes
         launch {
             settings.sendspinEnabled.collect { enabled ->
+                if (!enabled) {
+                    carPlayContinuity.invalidate(ContinuityInvalidation.LocalPlayerDisabled)
+                }
                 if (apiClient.sessionState.value is SessionState.Connected) {
                     if (enabled) {
                         localPlayerController.start()
@@ -935,11 +942,11 @@ class MainDataSource(
         return this
     }
 
-    fun playerAction(playerId: String, action: PlayerAction) {
+    fun playerAction(playerId: String, action: PlayerAction, explicitUserIntent: Boolean) {
         // Delegate to data-based overload for local player (handles optimistic + routing)
         if (playerId == settings.sendspinClientId.value) {
             localPlayerController.localPlayerData.value?.let { localData ->
-                playerAction(localData, action)
+                playerAction(localData, action, explicitUserIntent)
                 return
             }
         }
@@ -1059,10 +1066,10 @@ class MainDataSource(
         }
     }
 
-    fun playerAction(data: PlayerData, action: PlayerAction) {
+    fun playerAction(data: PlayerData, action: PlayerAction, explicitUserIntent: Boolean) {
         // The local player owns its optimistic update + offline-queue + send path.
         if (data.isLocal) {
-            localPlayerController.handleLocalCommand(data, action)
+            localPlayerController.handleLocalCommand(data, action, explicitUserIntent)
             return
         }
         val resolved = playerRequestFactory.resolve(data, action)
@@ -1090,6 +1097,7 @@ class MainDataSource(
                 }
 
                 is QueueAction.ClearQueue -> {
+                    carPlayContinuity.invalidate(ContinuityInvalidation.QueueClear)
                     apiClient.sendRequest(
                         Request.Queue.clear(
                             queueId = action.queueId,
@@ -1505,6 +1513,86 @@ class MainDataSource(
             }
             refreshAllPlayersQueueItems()
         }
+    }
+
+    private var continuityServerPlayers: List<ServerPlayer> = emptyList()
+    private var continuityPlayers: List<Player> = emptyList()
+    private var continuityQueues: List<QueueInfo> = emptyList()
+    private var continuityAuthority: CarPlayAuthority? = null
+    private var continuityPreparationJob: Job? = null
+    private val continuityGateway = object : CarPlayContinuityGateway {
+        override suspend fun refreshPlayers(): Boolean {
+            continuityServerPlayers = apiClient.sendRequest(Request.Player.all())
+                .resultAs<List<ServerPlayer>>() ?: return false
+            continuityPlayers = playerFactory.createList(continuityServerPlayers)
+            _serverPlayers.value = DataState.Data(continuityPlayers.filter { it.shouldBeShown })
+            return true
+        }
+
+        override suspend fun refreshQueues(): Boolean {
+            continuityQueues = apiClient.sendRequest(Request.Queue.all())
+                .resultAs<List<ServerQueue>>()?.let(queueFactory::createList) ?: return false
+            _queueInfos.value = continuityQueues
+            return true
+        }
+
+        override suspend fun fetchQueueItems(queueId: String): Boolean {
+            val player = continuityPlayers.firstOrNull { it.id == settings.sendspinClientId.value } ?: return false
+            val serverPlayer = continuityServerPlayers.firstOrNull { it.playerId == player.id } ?: return false
+            if (player.queueId != queueId) return false
+            val queue = continuityQueues.firstOrNull { it.id == queueId } ?: return false
+            val items = apiClient.sendRequest(Request.Queue.items(queueId))
+                .resultAs<List<ServerQueueItem>>()?.let(queueFactory::createTrackList) ?: return false
+            localPlayerController.onServerPlayerUpdate(player)
+            localPlayerController.onServerQueueUpdate(queue)
+            localPlayerController.onQueueItemsLoaded(queue, items)
+            continuityAuthority = CarPlayAuthority(
+                serverId = (apiClient.sessionState.value as? HasConnectionData)
+                    ?.connectionData?.serverInfo?.serverId ?: return false,
+                playerId = player.id,
+                queueId = queue.id,
+                currentItemId = queue.currentItem?.id ?: return false,
+                queueItemIds = items.map { it.id }.toSet(),
+                playerState = serverPlayer.state ?: return false,
+                elapsedTime = queue.elapsedTime ?: return false,
+            )
+            return true
+        }
+
+        override fun authority() = continuityAuthority
+        override fun play(playerId: String): Long? {
+            val nativeGeneration = mediaPlayerController.authorizeVerifiedContinuityPlayback()
+            if (nativeGeneration < 0L) return null
+            playerAction(playerId, PlayerAction.Play, explicitUserIntent = false)
+            return nativeGeneration
+        }
+    }
+
+    /** Prepares authority only. Swift performs the live route check before confirmation. */
+    fun onCarPlayConnected(completion: (Long?) -> Unit) {
+        if (continuityPreparationJob?.isActive == true) {
+            completion(null)
+            return
+        }
+        continuityPreparationJob = launch {
+            continuityAuthority = null
+            completion(carPlayContinuity.prepare(currentTimeMillis(), continuityGateway))
+        }
+    }
+
+    fun confirmCarPlayContinuity(ticket: Long, routeAvailable: Boolean, otherAudioOwner: Boolean) =
+        carPlayContinuity.confirm(
+            ticket,
+            currentTimeMillis(),
+            routeAvailable,
+            otherAudioOwner,
+            continuityGateway,
+        )
+
+    fun onCarPlayDisconnected() {
+        continuityPreparationJob?.cancel()
+        continuityPreparationJob = null
+        carPlayContinuity.disconnect()
     }
 
     private fun updateProvidersManifests() {

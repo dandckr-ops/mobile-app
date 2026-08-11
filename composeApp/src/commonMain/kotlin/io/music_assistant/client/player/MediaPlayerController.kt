@@ -13,7 +13,7 @@ import io.music_assistant.client.player.sendspin.model.AudioCodec
 expect class MediaPlayerController(platformContext: PlatformContext) {
     // Callback for remote commands (e.g. from iOS Control Center)
     // Common code can set this to receive commands like "play", "pause", "next", "previous"
-    var onRemoteCommand: ((String) -> Unit)?
+    var onRemoteCommand: ((String, String, Boolean) -> Unit)?
 
     // Sendspin streaming
     fun prepareStream(
@@ -36,6 +36,14 @@ expect class MediaPlayerController(platformContext: PlatformContext) {
 
     // Resume playback after a transport reconnect (resumes audio sink + sends play command)
     fun resume()
+
+    // Explicit user/verified-continuity intent may release an iOS route-loss safety hold.
+    fun allowPlaybackAfterUserIntent(): Long
+
+    // Returns a non-negative native safety generation, or -1 when the live route rejects it.
+    fun authorizeVerifiedContinuityPlayback(): Long
+
+    fun isPlaybackBlockedByRouteLoss(): Boolean
 
     // Volume control (0-100)
     fun setVolume(volume: Int)

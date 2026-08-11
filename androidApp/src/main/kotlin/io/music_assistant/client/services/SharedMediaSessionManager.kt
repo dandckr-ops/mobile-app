@@ -306,6 +306,7 @@ class SharedMediaSessionManager(
                             dataSource.playerAction(
                                 pd,
                                 PlayerAction.ToggleShuffle(current = it.shuffleEnabled),
+                                explicitUserIntent = true,
                             )
                         }
                     }
@@ -315,6 +316,7 @@ class SharedMediaSessionManager(
                             dataSource.playerAction(
                                 pd,
                                 PlayerAction.ToggleRepeatMode(current = repeatMode),
+                                explicitUserIntent = true,
                             )
                         }
                     }
@@ -328,7 +330,9 @@ class SharedMediaSessionManager(
         }
 
     private fun act(action: PlayerAction) {
-        currentPlayer()?.let { dataSource.playerAction(it, action) }
+        currentPlayer()?.let {
+            dataSource.playerAction(it, action, explicitUserIntent = true)
+        }
     }
 
     /**

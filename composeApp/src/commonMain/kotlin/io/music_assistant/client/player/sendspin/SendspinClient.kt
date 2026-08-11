@@ -25,27 +25,25 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.coroutines.CoroutineContext
 
+/**
+ * Reconnect attempt index 9 is roughly four minutes on the backoff ladder.
+ * Beyond it the server or user context may have changed, so auto-resume is unsafe.
+ */
+internal const val RECONNECT_AUTO_RESUME_MAX_ATTEMPTS = 9
+
 class SendspinClient(
     private val config: SendspinConfig,
     private val mediaPlayerController: MediaPlayerController,
     private val audioPipeline: AudioPipeline,
     private val clockSynchronizer: ClockSynchronizer,
     private val networkAvailable: StateFlow<Boolean>? = null,
+    private val transportAutoResumeAllowed: () -> Boolean = { false },
 ) : CoroutineScope {
     private val logger = Logger.withTag("SendspinClient")
     private val supervisorJob = SupervisorJob()
 
     override val coroutineContext: CoroutineContext
         get() = Dispatchers.Default + supervisorJob
-
-    companion object {
-        /** Max reconnect attempt index that still triggers auto-resume.
-         *  Matches attempt 9 = ~4 minutes on the backoff ladder.
-         *  Beyond this the outage is considered too long for safe
-         *  auto-resume — the server may have rebooted or the user
-         *  context may have changed. */
-        private const val RECONNECT_AUTO_RESUME_MAX_ATTEMPTS = 9
-    }
 
     // Components
     private var transport: SendspinTransport? = null
@@ -212,7 +210,13 @@ class SendspinClient(
                                 // and the outage wasn't too long (attempt <= threshold).
                                 // Beyond ~4 minutes (attempt 9) the server may have rebooted or
                                 // the user context changed — don't startle the user.
-                                if (wasStreaming && reconnectAttempt < RECONNECT_AUTO_RESUME_MAX_ATTEMPTS) {
+                                val autoResumeAllowed = transportAutoResumeAllowed()
+                                if (shouldAutoResumeAfterReconnect(
+                                        wasStreaming,
+                                        reconnectAttempt,
+                                        autoResumeAllowed,
+                                    )
+                                ) {
                                     try {
                                         mediaPlayerController.resume()
                                         logger.i { "Auto-resumed playback after reconnect (attempt $reconnectAttempt)" }
@@ -221,7 +225,7 @@ class SendspinClient(
                                     }
                                 } else if (wasStreaming) {
                                     logger.i {
-                                        "Skipped auto-resume after $reconnectAttempt attempts (max=$RECONNECT_AUTO_RESUME_MAX_ATTEMPTS)"
+                                        "Skipped auto-resume: attempt=$reconnectAttempt pendingCarPlayRouteLoss=${!autoResumeAllowed}"
                                     }
                                 }
                             }
@@ -464,3 +468,11 @@ class SendspinClient(
         supervisorJob.cancel()
     }
 }
+
+internal fun shouldAutoResumeAfterReconnect(
+    wasStreaming: Boolean,
+    reconnectAttempt: Int,
+    continuityAllowsResume: Boolean,
+): Boolean = wasStreaming &&
+    reconnectAttempt < RECONNECT_AUTO_RESUME_MAX_ATTEMPTS &&
+    continuityAllowsResume

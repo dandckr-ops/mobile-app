@@ -14,6 +14,10 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     // MARK: - Audio Buffer
     private var pcmBuffer: [Data] = []
     private let bufferLock = NSLock()
+    private let playbackGateLock = NSLock()
+    private let audioQueueUseLock = NSLock()
+    private let audioQueueLifecycleQueue = DispatchQueue(label: "io.music-assistant.audio-queue-lifecycle")
+    private let audioQueueLifecycleKey = DispatchSpecificKey<Void>()
     private let kNumberOfBuffers = 5 // More buffers for smoother playback
     private let kBufferSize: UInt32 = 65536 // 64KB per buffer for less stuttering
 
@@ -33,12 +37,20 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     // MARK: - State
     private var isPlaying = false
     /// True while local playback owns or is claiming the shared audio session.
-    var isRenderingAudio: Bool { streamStarted || isPlaying }
+    var isRenderingAudio: Bool {
+        playbackGateLock.lock()
+        let rendering = streamStarted || isPlaying
+        playbackGateLock.unlock()
+        return rendering
+    }
     private var streamStarted = false
     // Play-intent gate (mirrors Android's shouldPlayAudio). While false — paused or
     // interrupted — incoming audio is dropped instead of (re)starting the queue, so
     // a packet still in the consumer pipeline can't undo an optimistic pause.
-    private var shouldPlay = true
+    private var shouldPlay = false
+    private var routeLossSafetyInitialized = false
+    private var routeLossPlaybackBlocked = false
+    private var playbackSafetyGeneration: Int64 = 0
     // True only while we hold a server pause issued in response to an audio-session
     // interruption (phone call, Siri). On .ended we auto-resume the server only if
     // this is set — so we never spontaneously start playback that the user didn't
@@ -53,8 +65,16 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     private func logError(_ message: String) { NativeLog.shared.error(tag: Self.logTag, message: message) }
     private func logDebug(_ message: String) { NativeLog.shared.debug(tag: Self.logTag, message: message) }
 
+    private func withAudioQueueLifecycle<T>(_ body: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: audioQueueLifecycleKey) != nil {
+            return body()
+        }
+        return audioQueueLifecycleQueue.sync(execute: body)
+    }
+
     override init() {
         super.init()
+        audioQueueLifecycleQueue.setSpecific(key: audioQueueLifecycleKey, value: ())
         logDebug("Initialized")
 
         // Handle audio session interruptions (phone calls, Siri, alarms)
@@ -88,22 +108,39 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
             // resumes from the same position afterwards instead of skipping ahead while
             // the call held the audio session.
             logInfo("Audio session interrupted")
-            if isPlaying {
-                pausedByInterruption = true
+            playbackGateLock.lock()
+            let ownedPlayback = shouldPlay || streamStarted || isPlaying
+            if ownedPlayback { pausedByInterruption = true }
+            playbackGateLock.unlock()
+            if ownedPlayback {
                 logInfo("Pausing server playback due to interruption")
-                remoteCommandHandler?.onCommand(command: "pause", source: "interruption")
+                remoteCommandHandler?.onCommand(
+                    command: "pause",
+                    source: "interruption",
+                    explicitUserIntent: false
+                )
             }
         case .ended:
-            guard pausedByInterruption else { break }
+            playbackGateLock.lock()
+            let shouldResume = pausedByInterruption
             pausedByInterruption = false
+            let routeBlocked = routeLossPlaybackBlocked
+            playbackGateLock.unlock()
+            guard shouldResume else { break }
             // We deliberately do not use .shouldResume here as it is not guaranteed
             // to be set even in cases it should be. As per Apple, it's a hint not
             // a contract. Instead we track for ourselves if we were interrupted,
             // and once control is handed back, if another app is now using the
             // audio device exclusively.
-            if !AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint {
+            if routeBlocked {
+                logInfo("Interruption ended while route-loss hold is active — staying paused")
+            } else if !AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint {
                 logInfo("Resuming server playback after interruption")
-                remoteCommandHandler?.onCommand(command: "play", source: "interruption")
+                remoteCommandHandler?.onCommand(
+                    command: "play",
+                    source: "interruption",
+                    explicitUserIntent: false
+                )
             } else {
                 logInfo("Another app holds audio — staying paused")
             }
@@ -125,26 +162,82 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
         }
     }
 
-    /// Pause when the active output route disappears (Bluetooth disconnect,
-    /// headphones unplug, AirPods power-off, CarPlay disconnect) — never let
-    /// playback silently fall back to the phone speaker. Shutting `shouldPlay`
-    /// drops in-flight packets so the next one can't rebuild the queue on the
-    /// new route; the server pause stops the stream at the source. Unlike an
-    /// interruption, iOS sends no matching `.ended`, so this is a deliberate
-    /// pause the user resumes by hand, on whatever route is then active.
-    /// (AirPods already send their own `pause` remote command on removal; the
-    /// `streamStarted` guard makes this a no-op once that has shut the gate.)
+    /// Pause when the active output route disappears. CarPlay loss additionally
+    /// arms the durable route-loss gate so decoded or in-flight PCM cannot fall
+    /// through to the phone speaker before the server pause lands. Non-CarPlay
+    /// route losses still pause and tear down the queue, but do not latch the
+    /// CarPlay safety gate; the user can resume normally on the new route.
+    /// Idle route changes are ignored; repeated CarPlay route notifications are
+    /// suppressed after the first gated transition.
     private func handleOldDeviceUnavailable(previousRoute: AVAudioSessionRouteDescription?) {
-        guard streamStarted else { return }
+        let wasCarPlay = previousRoute.map { route in
+            route.outputs.isEmpty || route.outputs.contains { $0.portType == .carAudio }
+        } ?? true
         let prev = previousRoute?.outputs.first?.portType.rawValue ?? "unknown"
-        logInfo("\(prev) disappeared — pausing playback")
-        shouldPlay = false
-        streamStarted = false
-        stopAudioQueue()
-        bufferLock.lock()
-        pcmBuffer.removeAll()
-        bufferLock.unlock()
-        remoteCommandHandler?.onCommand(command: "pause", source: "route_loss")
+        audioQueueUseLock.lock()
+        playbackGateLock.lock()
+        let interrupted = pausedByInterruption
+        let armed = shouldPlay || streamStarted || isPlaying || interrupted
+        let blocked = routeLossPlaybackBlocked
+        var routeLossGeneration = playbackSafetyGeneration
+        if armed {
+            playbackSafetyGeneration &+= 1
+            routeLossGeneration = playbackSafetyGeneration
+            // Close the write/start gate immediately for CarPlay only. Queue
+            // teardown is serialized below, but must never delay the CarPlay
+            // safety decision behind queue creation or startup. Non-CarPlay
+            // route loss pauses/tears down without latching this durable gate.
+            if wasCarPlay {
+                routeLossPlaybackBlocked = true
+            }
+            shouldPlay = false
+            streamStarted = false
+            pausedByInterruption = false
+        }
+        playbackGateLock.unlock()
+        audioQueueUseLock.unlock()
+
+        guard armed else {
+            logInfo("\(prev) disappeared while playback was idle — no hold armed")
+            return
+        }
+        var routeLossAccepted = !wasCarPlay
+        if wasCarPlay && !blocked {
+            routeLossAccepted = KmpHelper.shared.recordCarPlayRouteLossHold(
+                wasInterrupted: interrupted,
+                nativeGeneration: routeLossGeneration
+            )
+        }
+        guard !blocked else { return }
+        guard routeLossAccepted else {
+            logInfo("Ignoring stale CarPlay route loss after newer playback intent")
+            return
+        }
+        let source = wasCarPlay && interrupted
+            ? "carplay_route_loss_interruption"
+            : (wasCarPlay ? "carplay_route_loss" : "route_loss")
+        var applied = false
+        withAudioQueueLifecycle {
+            playbackGateLock.lock()
+            let isCurrent = routeLossGeneration == playbackSafetyGeneration
+            playbackGateLock.unlock()
+            guard isCurrent else { return }
+
+            bufferLock.lock()
+            pcmBuffer.removeAll()
+            bufferLock.unlock()
+            stopAudioQueue()
+            logInfo("\(prev) disappeared — pausing playback")
+            remoteCommandHandler?.onCommand(
+                command: "pause",
+                source: source,
+                explicitUserIntent: false
+            )
+            applied = true
+        }
+        if !applied {
+            logInfo("Ignoring superseded route loss after newer playback intent")
+        }
     }
 
     // MARK: - PlatformAudioPlayer Protocol
@@ -157,8 +250,13 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
         self.currentSampleRate = sampleRate
         self.currentChannels = channels
         self.currentBitDepth = bitDepth
-        self.streamStarted = false
-        self.shouldPlay = true
+        withAudioQueueLifecycle {
+            playbackGateLock.lock()
+            self.streamStarted = false
+            self.shouldPlay = routeLossSafetyInitialized && !routeLossPlaybackBlocked
+            playbackGateLock.unlock()
+            stopAudioQueue()
+        }
 
         // Decode codec header if present
         if let headerBase64 = codecHeader, let headerData = Data(base64Encoded: headerBase64) {
@@ -167,9 +265,6 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
         } else {
             self.codecHeader = nil
         }
-
-        // Stop any existing playback
-        stopAudioQueue()
 
         // Clear buffers
         bufferLock.lock()
@@ -218,15 +313,23 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
         // Suspended (paused / interrupted): drop in-flight audio rather than
         // restart the queue, so a packet still in the consumer pipeline can't
         // undo the pause before the server stops streaming.
-        guard shouldPlay else { return }
-
-        // Start audio queue on first data
-        if !streamStarted {
-            streamStarted = true
-            logDebug("First data received (\(swiftData.count) bytes)")
-            NowPlayingCoordinator.shared.activatePlayback()
-            startAudioQueue()
+        let accepted = withAudioQueueLifecycle { () -> Bool in
+            playbackGateLock.lock()
+            guard shouldPlay && !routeLossPlaybackBlocked else {
+                playbackGateLock.unlock()
+                return false
+            }
+            let needsStart = !streamStarted
+            if needsStart { streamStarted = true }
+            playbackGateLock.unlock()
+            if needsStart {
+                logDebug("First data received (\(swiftData.count) bytes)")
+                NowPlayingCoordinator.shared.activatePlayback()
+                startAudioQueue()
+            }
+            return true
         }
+        guard accepted else { return }
 
         decoderLock.lock()
         defer { decoderLock.unlock() }
@@ -238,9 +341,15 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
 
         do {
             let pcmData = try decoder.decode(swiftData)
+            playbackGateLock.lock()
+            guard shouldPlay && !routeLossPlaybackBlocked else {
+                playbackGateLock.unlock()
+                return
+            }
             bufferLock.lock()
             pcmBuffer.append(pcmData)
             bufferLock.unlock()
+            playbackGateLock.unlock()
         } catch {
             logDebug("Decode error: \(error)")
         }
@@ -248,9 +357,13 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
 
     func stopRawPcmStream() {
         logInfo("Stopping stream")
-        shouldPlay = false
-        streamStarted = false
-        stopAudioQueue()
+        withAudioQueueLifecycle {
+            playbackGateLock.lock()
+            shouldPlay = false
+            streamStarted = false
+            playbackGateLock.unlock()
+            stopAudioQueue()
+        }
 
         bufferLock.lock()
         pcmBuffer.removeAll()
@@ -263,9 +376,13 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     /// resume then rebuilds clean on the next packet, like a cold start.
     func pauseSink() {
         logInfo("pauseSink")
-        shouldPlay = false
-        streamStarted = false
-        tearDownQueue()
+        withAudioQueueLifecycle {
+            playbackGateLock.lock()
+            shouldPlay = false
+            streamStarted = false
+            playbackGateLock.unlock()
+            tearDownQueue()
+        }
     }
 
     /// Reactivating the session reclaims audio from another app that grabbed it.
@@ -273,12 +390,98 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     /// audio packet, or is started here if one still exists (gapless restart).
     func resumeSink() {
         logInfo("resumeSink")
-        shouldPlay = true
-        NowPlayingCoordinator.shared.activatePlayback()
-        isPlaying = true
-        if let queue = audioQueue {
-            AudioQueueStart(queue, nil)
+        withAudioQueueLifecycle {
+            playbackGateLock.lock()
+            guard routeLossSafetyInitialized && !routeLossPlaybackBlocked else {
+                playbackGateLock.unlock()
+                logInfo("resumeSink suppressed by route-loss safety hold")
+                return
+            }
+            shouldPlay = true
+            isPlaying = true
+            playbackGateLock.unlock()
+            NowPlayingCoordinator.shared.activatePlayback()
+            if let queue = audioQueue {
+                playbackGateLock.lock()
+                let mayStart = shouldPlay && routeLossSafetyInitialized && !routeLossPlaybackBlocked
+                playbackGateLock.unlock()
+                guard mayStart else {
+                    tearDownQueue()
+                    return
+                }
+                let status = AudioQueueStart(queue, nil)
+                playbackGateLock.lock()
+                let stillAllowed = shouldPlay && routeLossSafetyInitialized && !routeLossPlaybackBlocked
+                isPlaying = status == noErr && stillAllowed
+                playbackGateLock.unlock()
+                if status != noErr || !stillAllowed {
+                    tearDownQueue()
+                }
+            }
         }
+    }
+
+    func restoreRouteLossPlaybackBlock() {
+        playbackGateLock.lock()
+        routeLossSafetyInitialized = true
+        routeLossPlaybackBlocked = true
+        shouldPlay = false
+        playbackGateLock.unlock()
+        bufferLock.lock()
+        pcmBuffer.removeAll()
+        bufferLock.unlock()
+    }
+
+    func initializeRouteLossPlaybackSafety() {
+        playbackGateLock.lock()
+        routeLossSafetyInitialized = true
+        playbackGateLock.unlock()
+    }
+
+    func isRouteLossPlaybackBlocked() -> Bool {
+        playbackGateLock.lock()
+        let blocked = routeLossPlaybackBlocked || !routeLossSafetyInitialized
+        playbackGateLock.unlock()
+        return blocked
+    }
+
+    func allowPlaybackAfterUserIntent() -> Int64 {
+        return withAudioQueueLifecycle {
+            audioQueueUseLock.lock()
+            playbackGateLock.lock()
+            playbackSafetyGeneration &+= 1
+            routeLossSafetyInitialized = true
+            routeLossPlaybackBlocked = false
+            shouldPlay = true
+            let generation = playbackSafetyGeneration
+            playbackGateLock.unlock()
+            audioQueueUseLock.unlock()
+            return generation
+        }
+    }
+
+    func authorizeVerifiedContinuityPlayback() -> Int64 {
+        // Match route-loss lock ordering so a route callback already in progress wins.
+        audioQueueUseLock.lock()
+        playbackGateLock.lock()
+        let session = AVAudioSession.sharedInstance()
+        let carPlayAvailable = session.currentRoute.outputs.contains { $0.portType == .carAudio }
+        let safe = routeLossSafetyInitialized &&
+            routeLossPlaybackBlocked &&
+            carPlayAvailable &&
+            !session.secondaryAudioShouldBeSilencedHint
+        guard safe else {
+            playbackGateLock.unlock()
+            audioQueueUseLock.unlock()
+            return -1
+        }
+        playbackSafetyGeneration &+= 1
+        routeLossPlaybackBlocked = false
+        shouldPlay = true
+        let generation = playbackSafetyGeneration
+        playbackGateLock.unlock()
+        audioQueueUseLock.unlock()
+        return generation
     }
 
     /// Drop buffered PCM (track transition / playback-delay re-phase).
@@ -289,20 +492,30 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     }
 
     func setVolume(volume: Int32) {
-        guard let queue = audioQueue else { return }
-        let floatVolume = Float(volume) / 100.0
-        AudioQueueSetParameter(queue, kAudioQueueParam_Volume, floatVolume)
+        withAudioQueueLifecycle {
+            guard let queue = audioQueue else { return }
+            let floatVolume = Float(volume) / 100.0
+            AudioQueueSetParameter(queue, kAudioQueueParam_Volume, floatVolume)
+        }
     }
 
     func setMuted(muted: Bool) {
-        guard let queue = audioQueue else { return }
-        AudioQueueSetParameter(queue, kAudioQueueParam_Volume, muted ? 0.0 : 1.0)
+        withAudioQueueLifecycle {
+            guard let queue = audioQueue else { return }
+            AudioQueueSetParameter(queue, kAudioQueueParam_Volume, muted ? 0.0 : 1.0)
+        }
     }
 
     func dispose() {
         // The Now Playing surface is cleared by the track channel going null
         // (pipeline teardown removes the current item); no direct clear here.
-        stopAudioQueue()
+        withAudioQueueLifecycle {
+            playbackGateLock.lock()
+            shouldPlay = false
+            streamStarted = false
+            playbackGateLock.unlock()
+            stopAudioQueue()
+        }
         decoderLock.lock()
         decoder = nil
         decoderLock.unlock()
@@ -354,7 +567,9 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
             return
         }
 
+        audioQueueUseLock.lock()
         audioQueue = queue
+        audioQueueUseLock.unlock()
 
         // Allocate and prime buffers
         for _ in 0..<kNumberOfBuffers {
@@ -366,36 +581,76 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
             }
         }
 
-        // Start playback
+        // Route-loss notification closes this gate without waiting for this lifecycle queue.
+        // Recheck immediately before and after AudioQueueStart so a route transition racing
+        // queue creation cannot leave a queue running on the replacement output.
+        playbackGateLock.lock()
+        let mayStart = shouldPlay && routeLossSafetyInitialized && !routeLossPlaybackBlocked
+        playbackGateLock.unlock()
+        guard mayStart else {
+            tearDownQueue()
+            return
+        }
+
         let startStatus = AudioQueueStart(queue, nil)
-        if startStatus == noErr {
-            isPlaying = true
+        playbackGateLock.lock()
+        let stillAllowed = shouldPlay && routeLossSafetyInitialized && !routeLossPlaybackBlocked
+        isPlaying = startStatus == noErr && stillAllowed
+        if !isPlaying { streamStarted = false }
+        playbackGateLock.unlock()
+
+        if startStatus == noErr && stillAllowed {
             logInfo("AudioQueue started")
         } else {
-            logError("Failed to start AudioQueue: \(startStatus)")
+            if startStatus != noErr {
+                logError("Failed to start AudioQueue: \(startStatus)")
+            } else {
+                logInfo("AudioQueue start cancelled by route-loss gate")
+            }
+            tearDownQueue()
         }
     }
 
     private func stopAudioQueue() {
         tearDownQueue()
+        playbackGateLock.lock()
         pausedByInterruption = false // Stream stopped — no auto-resume on .ended.
+        playbackGateLock.unlock()
+        NowPlayingCoordinator.shared.deactivatePlayback()
     }
-
     /// `AudioQueueStop(_, true)` discards enqueued hardware buffers, so a rebuilt
     /// queue never replays stale audio. Leaves `pausedByInterruption` untouched —
     /// a pause issued during `.began` must still auto-resume on `.ended`.
     private func tearDownQueue() {
-        guard let queue = audioQueue else { return }
-
-        AudioQueueStop(queue, true)
-        AudioQueueDispose(queue, true)
-
+        audioQueueUseLock.lock()
+        let queue = audioQueue
         audioQueue = nil
+        audioQueueUseLock.unlock()
+        if let queue {
+            AudioQueueStop(queue, true)
+            AudioQueueDispose(queue, true)
+        }
+        playbackGateLock.lock()
         isPlaying = false
+        playbackGateLock.unlock()
         logInfo("AudioQueue stopped")
     }
 
     fileprivate func fillBuffer(queue: AudioQueueRef, buffer: AudioQueueBufferRef) {
+        // Queue ownership is detached before teardown. A callback that arrives after
+        // detachment returns without touching a queue being stopped or disposed.
+        audioQueueUseLock.lock()
+        guard audioQueue == queue else {
+            audioQueueUseLock.unlock()
+            return
+        }
+        defer { audioQueueUseLock.unlock() }
+
+        playbackGateLock.lock()
+        let mayEnqueue = shouldPlay && routeLossSafetyInitialized && !routeLossPlaybackBlocked
+        playbackGateLock.unlock()
+        guard mayEnqueue else { return }
+
         // Get next PCM data from buffer
         bufferLock.lock()
         let pcmData = pcmBuffer.isEmpty ? nil : pcmBuffer.removeFirst()
@@ -414,7 +669,13 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
             buffer.pointee.mAudioDataByteSize = buffer.pointee.mAudioDataBytesCapacity
         }
 
-        // Re-enqueue buffer
+        playbackGateLock.lock()
+        let stillAllowed = shouldPlay && routeLossSafetyInitialized && !routeLossPlaybackBlocked
+        playbackGateLock.unlock()
+        guard stillAllowed else { return }
+
+        // Re-enqueue while queue ownership is still held. Route-loss gate closure
+        // takes the same short ownership lock, so no enqueue can follow it.
         AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
     }
 
@@ -434,7 +695,11 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
 
         NowPlayingCoordinator.shared.setCommandHandler { [weak self] command in
             self?.logInfo("Remote command: \(command)")
-            self?.remoteCommandHandler?.onCommand(command: command, source: "remote")
+            self?.remoteCommandHandler?.onCommand(
+                command: command,
+                source: "remote",
+                explicitUserIntent: false
+            )
         }
     }
 }

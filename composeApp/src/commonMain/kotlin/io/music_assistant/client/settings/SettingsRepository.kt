@@ -2,6 +2,7 @@ package io.music_assistant.client.settings
 
 import com.russhwolf.settings.Settings
 import io.music_assistant.client.api.ConnectionInfo
+import io.music_assistant.client.data.CarPlayContinuityRecord
 import io.music_assistant.client.data.model.client.ClickContext
 import io.music_assistant.client.data.model.client.GenreEmptyFilter
 import io.music_assistant.client.data.model.client.ItemKind
@@ -26,6 +27,22 @@ import kotlin.uuid.Uuid
 class SettingsRepository(
     private val settings: Settings,
 ) {
+    fun loadCarPlayContinuity(): CarPlayContinuityRecord? =
+        settings.getStringOrNull("carplay_continuity")?.let { raw ->
+            runCatching { myJson.decodeFromString<CarPlayContinuityRecord>(raw) }.getOrNull()
+        }
+
+    fun saveCarPlayContinuity(record: CarPlayContinuityRecord?) {
+        record?.let { settings.putString("carplay_continuity", myJson.encodeToString(it)) }
+            ?: settings.remove("carplay_continuity")
+    }
+    fun loadCarPlayRouteLossHoldAt(): Long =
+        settings.getLong("carplay_route_loss_hold_at", 0L)
+
+    fun saveCarPlayRouteLossHoldAt(epochMs: Long?) {
+        epochMs?.let { settings.putLong("carplay_route_loss_hold_at", it) }
+            ?: settings.remove("carplay_route_loss_hold_at")
+    }
     private val _theme = MutableStateFlow(
         ThemeSetting.valueOf(
             settings.getString("theme", ThemeSetting.FollowSystem.name),
