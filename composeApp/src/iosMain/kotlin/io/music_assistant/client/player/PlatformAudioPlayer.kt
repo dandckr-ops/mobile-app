@@ -29,6 +29,21 @@ interface PlatformAudioPlayer {
     /** Resume output, reactivating the audio session to reclaim it from other apps. */
     fun resumeSink()
 
+    /** Restore a persisted route-loss hold before cold-launch streaming begins. */
+    fun restoreRouteLossPlaybackBlock()
+
+    /** Mark the native gate initialized after persistence has been checked and no hold exists. */
+    fun initializeRouteLossPlaybackSafety()
+
+    /** Report the live native route-loss gate for transport reconnect vetoes. */
+    fun isRouteLossPlaybackBlocked(): Boolean
+
+    /** Release after explicit user intent and return its monotonic native safety generation. */
+    fun allowPlaybackAfterUserIntent(): Long
+
+    /** Atomically authorize verified continuity only while the live CarPlay route remains safe. */
+    fun authorizeVerifiedContinuityPlayback(): Long
+
     /** Drop buffered PCM (track transition / playback-delay re-phase). */
     fun flush()
 
@@ -53,7 +68,7 @@ interface PlatformAudioPlayer {
  * playback.
  */
 interface RemoteCommandHandler {
-    fun onCommand(command: String, source: String)
+    fun onCommand(command: String, source: String, explicitUserIntent: Boolean)
 }
 
 /**

@@ -81,7 +81,11 @@ class MainMediaPlaybackService : MediaBrowserServiceCompat() {
                     dataSource.localPlayer.value
                         ?.takeIf { it.player.isPlaying }
                         ?.let { localPlayer ->
-                            dataSource.playerAction(localPlayer, PlayerAction.Pause)
+                            dataSource.playerAction(
+                                localPlayer,
+                                PlayerAction.Pause,
+                                explicitUserIntent = false,
+                            )
                         }
                 }
             }

@@ -24,7 +24,7 @@ import io.music_assistant.client.player.sendspin.model.AudioCodec
  */
 actual class MediaPlayerController actual constructor(platformContext: PlatformContext) {
     // Callback for remote commands - currently unused on Android (handled via different mechanism if needed)
-    actual var onRemoteCommand: ((String) -> Unit)? = null
+    actual var onRemoteCommand: ((String, String, Boolean) -> Unit)? = null
     private val logger = Logger.withTag("MediaPlayerController")
     private val context: Context = platformContext.applicationContext
     private val audioManager: AudioManager =
@@ -83,7 +83,7 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 shouldPlayAudio = false
                 pausedByFocusLoss = true
                 audioTrack?.pause()
-                onRemoteCommand?.invoke("pause")
+                onRemoteCommand?.invoke("pause", "audio_focus", false)
             }
             // Resume is driven by AUDIOFOCUS_GAIN only — mode can return to NORMAL before
             // focus is restored, and we only auto-resume what we paused.
@@ -116,7 +116,7 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 if (pausedByFocusLoss) {
                     pausedByFocusLoss = false
                     logger.i { "Resuming server playback after focus regain" }
-                    onRemoteCommand?.invoke("play")
+                    onRemoteCommand?.invoke("play", "audio_focus", false)
                 }
             }
 
@@ -137,7 +137,7 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 if (wasPlaying) {
                     pausedByFocusLoss = true
                     logger.i { "Pausing server playback due to focus loss" }
-                    onRemoteCommand?.invoke("pause")
+                    onRemoteCommand?.invoke("pause", "audio_focus", false)
                 }
             }
 
@@ -434,8 +434,14 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
 
     actual fun resume() {
         resumeSink()
-        onRemoteCommand?.invoke("play")
+        onRemoteCommand?.invoke("play", "transport_reconnect", false)
     }
+
+    actual fun allowPlaybackAfterUserIntent(): Long = 0L
+
+    actual fun authorizeVerifiedContinuityPlayback(): Long = 0L
+
+    actual fun isPlaybackBlockedByRouteLoss(): Boolean = false
 
     actual fun stopRawPcmStream() {
         logger.i { "Stopping raw PCM stream" }

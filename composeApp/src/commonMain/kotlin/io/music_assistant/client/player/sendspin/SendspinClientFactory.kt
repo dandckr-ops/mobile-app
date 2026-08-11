@@ -7,6 +7,7 @@ import co.touchlab.kermit.Logger
 import io.ktor.http.Url
 import io.music_assistant.client.api.ConnectionInfo
 import io.music_assistant.client.api.ServiceClient
+import io.music_assistant.client.data.CarPlayContinuityCoordinator
 import io.music_assistant.client.player.MediaPlayerController
 import io.music_assistant.client.player.sendspin.audio.AudioStreamManager
 import io.music_assistant.client.player.sendspin.transport.WebRTCDataChannelTransport
@@ -40,7 +41,12 @@ class SendspinClientFactory(
     private val mediaPlayerController: MediaPlayerController,
     private val serviceClient: ServiceClient,
     private val networkMonitor: NetworkMonitor,
+    private val carPlayContinuity: CarPlayContinuityCoordinator,
 ) {
+    private val transportAutoResumeAllowed: () -> Boolean = {
+        carPlayContinuity.allowsTransportAutoResume() &&
+            !mediaPlayerController.isPlaybackBlockedByRouteLoss()
+    }
     private val log = Logger.withTag("SendspinClientFactory")
 
     // Long-lived scope for hot-tunable settings observers. Cancelled only when the
@@ -194,6 +200,7 @@ class SendspinClientFactory(
             audioPipeline = pipeline,
             clockSynchronizer = clockSync,
             networkAvailable = networkMonitor.isAvailable,
+            transportAutoResumeAllowed = transportAutoResumeAllowed,
         )
         val transport = WebRTCDataChannelTransport(webrtcChannel)
         client.connectWithTransport(transport)
@@ -251,6 +258,7 @@ class SendspinClientFactory(
             audioPipeline = pipeline,
             clockSynchronizer = clockSync,
             networkAvailable = networkMonitor.isAvailable,
+            transportAutoResumeAllowed = transportAutoResumeAllowed,
         )
         client.start()
         log.i { "Sendspin client started via WebSocket" }

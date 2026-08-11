@@ -25,7 +25,9 @@ import io.music_assistant.client.player.sendspin.model.GoodbyeReason
 import io.music_assistant.client.settings.SettingsRepository
 import io.music_assistant.client.ui.compose.common.DataState
 import io.music_assistant.client.ui.compose.common.action.PlayerAction
+import io.music_assistant.client.utils.HasConnectionData
 import io.music_assistant.client.utils.SessionState
+import io.music_assistant.client.utils.currentTimeMillis
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
@@ -83,6 +85,8 @@ class LocalPlayerController(
     private val playerRequestFactory: PlayerRequestFactory,
     private val positionTracker: PlayerPositionTracker,
     private val errorBus: ErrorMessageBus,
+    private val carPlayContinuity: CarPlayContinuityCoordinator,
+    private val playbackIntentLane: LocalPlaybackIntentLane,
 ) : CoroutineScope {
     private val log = Logger.withTag("LocalPlayerCtrl")
 
@@ -133,7 +137,11 @@ class LocalPlayerController(
     private val commandQueueMutex = Mutex()
     private val commandQueue = mutableListOf<QueuedEntry>()
 
-    private data class QueuedEntry(val action: PlayerAction, val request: Request)
+    private data class QueuedEntry(
+        val action: PlayerAction,
+        val request: Request,
+        val playbackIntentGeneration: Long?,
+    )
 
     init {
         // Reset clock sync on foreground unless playback held CPU awake through
@@ -160,24 +168,86 @@ class LocalPlayerController(
      * Applies the optimistic UI update immediately, then sends — or offline-queues — the
      * request. Routes uniformly through the MA REST API (no transport split).
      */
-    fun handleLocalCommand(data: PlayerData, action: PlayerAction) {
-        val resolved = playerRequestFactory.resolve(data, action)
+    fun handleLocalCommand(
+        data: PlayerData,
+        action: PlayerAction,
+        explicitUserIntent: Boolean,
+    ) {
+        val routeLossBlocked = mediaPlayerController.isPlaybackBlockedByRouteLoss()
+        val absoluteAction = when (action) {
+            PlayerAction.TogglePlayPause ->
+                if (explicitUserIntent && routeLossBlocked) {
+                    PlayerAction.Play
+                } else if (data.player.isPlaying) {
+                    PlayerAction.Pause
+                } else {
+                    PlayerAction.Play
+                }
+            else -> action
+        }
+        if (absoluteAction == PlayerAction.Play && !explicitUserIntent && routeLossBlocked) {
+            log.i { "Ignoring non-explicit play while route-loss safety hold is active" }
+            return
+        }
+        val resolved = playerRequestFactory.resolve(data, absoluteAction)
+        when {
+            resolved == PlayerAction.Pause && explicitUserIntent ->
+                carPlayContinuity.invalidate(ContinuityInvalidation.ManualPause)
+            resolved is PlayerAction.SetPower && !resolved.powered && explicitUserIntent ->
+                carPlayContinuity.invalidate(ContinuityInvalidation.Stop)
+            resolved == PlayerAction.Play && explicitUserIntent -> {
+                val nativeGeneration = mediaPlayerController.allowPlaybackAfterUserIntent()
+                if (nativeGeneration < 0L) {
+                    log.w { "Rejecting explicit Play because native playback safety is unavailable" }
+                    return
+                }
+                val accepted = carPlayContinuity.invalidate(
+                    ContinuityInvalidation.UserPlay,
+                    nativeGeneration,
+                )
+                if (!accepted) {
+                    log.i { "Rejecting explicit Play superseded by a newer native safety event" }
+                    return
+                }
+            }
+        }
+        val playbackIntentGeneration = when (resolved) {
+            PlayerAction.Play,
+            PlayerAction.Pause,
+            is PlayerAction.SetPower,
+            -> playbackIntentLane.issue()
+            else -> null
+        }
         applyOptimisticUpdate(data, resolved)
         launch {
-            val request = playerRequestFactory.buildRequest(data, resolved) ?: return@launch
-            // Request-driven recovery: if the Sendspin transport was torn down (e.g. the
-            // process outlived a foreground-service stop) while the feature is still enabled,
-            // revive it and queue this command for replay on Ready instead of firing it at a
-            // dead transport (which surfaces as "queue not available"). Nothing else
-            // resurrects the transport in-process — the play choke point does.
-            if (_sendspinState.value == null && settings.sendspinEnabled.value) {
-                log.i { "Local command with no live Sendspin transport — reviving and queueing" }
-                enqueue(resolved, request)
-                launch { start() }
-                return@launch
+            if (playbackIntentGeneration == null) {
+                dispatchResolvedCommand(data, resolved, null)
+            } else {
+                playbackIntentLane.executeIfCurrent(playbackIntentGeneration) {
+                    dispatchResolvedCommand(data, resolved, playbackIntentGeneration)
+                }
             }
-            sendOrQueue(resolved, request)
         }
+    }
+
+    private suspend fun dispatchResolvedCommand(
+        data: PlayerData,
+        action: PlayerAction,
+        playbackIntentGeneration: Long?,
+    ) {
+        val request = playerRequestFactory.buildRequest(data, action) ?: return
+        // Request-driven recovery: if the Sendspin transport was torn down (e.g. the
+        // process outlived a foreground-service stop) while the feature is still enabled,
+        // revive it and queue this command for replay on Ready instead of firing it at a
+        // dead transport (which surfaces as "queue not available"). Nothing else
+        // resurrects the transport in-process — the play choke point does.
+        if (_sendspinState.value == null && settings.sendspinEnabled.value) {
+            log.i { "Local command with no live Sendspin transport — reviving and queueing" }
+            enqueue(action, request, playbackIntentGeneration)
+            launch { start() }
+            return
+        }
+        sendOrQueue(action, request, playbackIntentGeneration)
     }
 
     // --- Optimistic UI updates ---
@@ -299,16 +369,22 @@ class LocalPlayerController(
 
     // --- Command queue (online: send immediately, offline: queue with dedup) ---
 
-    private suspend fun sendOrQueue(action: PlayerAction, request: Request) {
+    private suspend fun sendOrQueue(
+        action: PlayerAction,
+        request: Request,
+        playbackIntentGeneration: Long?,
+    ) {
         // Fast-path queue when known-offline avoids burning the gate's 10s timeout
         // on actions the user already perceives as "do this when we're back."
         // The Result.isFailure fallback closes the TOCTOU window where the state
         // flips between the check and the send.
         if (!apiClient.isReadyForCommands.value) {
-            enqueue(action, request)
+            enqueue(action, request, playbackIntentGeneration)
             return
         }
-        if (apiClient.sendRequest(request).isFailure) enqueue(action, request)
+        if (apiClient.sendRequest(request).isFailure) {
+            enqueue(action, request, playbackIntentGeneration)
+        }
     }
 
     fun drainCommandQueue() {
@@ -319,7 +395,13 @@ class LocalPlayerController(
                 commandQueue.toList().also { commandQueue.clear() }
             }
             entries.forEach { entry ->
-                apiClient.sendRequest(entry.request)
+                if (entry.playbackIntentGeneration == null) {
+                    apiClient.sendRequest(entry.request)
+                } else {
+                    playbackIntentLane.executeIfCurrent(entry.playbackIntentGeneration) {
+                        apiClient.sendRequest(entry.request)
+                    }
+                }
                 delay(100)
             }
         }
@@ -510,11 +592,44 @@ class LocalPlayerController(
 
         // Set up remote command handler for Control Center/Lock Screen commands.
         // Routed through the canonical local-command entry.
-        mediaPlayerController.onRemoteCommand = { command ->
+        mediaPlayerController.onRemoteCommand = { command, source, explicitUserIntent ->
+            val routeLostAt = currentTimeMillis()
+            if (command == "pause" && source == "remote") {
+                // MPRemoteCommandCenter does not identify whether a human or an accessory emitted
+                // the command. Fail closed: veto restoration, but do not call it manual intent and
+                // do not clear the route-loss safety hold.
+                carPlayContinuity.invalidate(ContinuityInvalidation.UntrustedRemotePause)
+            }
             localPlayerData.value?.let { playerData ->
-                log.i { "Remote command: $command" }
+                log.i { "Remote command: command=$command source=$source" }
+                if (isCarPlayRouteLoss(command, source)) {
+                    val serverId = (apiClient.sessionState.value as? HasConnectionData)
+                        ?.connectionData?.serverInfo?.serverId
+                    val queue = playerData.queueInfo
+                    val currentItemId = queue?.currentItem?.id
+                    if (serverId != null && queue != null && currentItemId != null) {
+                        carPlayContinuity.recordRouteLoss(
+                            CarPlayContinuityRecord(
+                                serverId = serverId,
+                                playerId = playerData.playerId,
+                                queueId = queue.id,
+                                currentItemId = currentItemId,
+                                wasPlaying = playerData.player.isPlaying ||
+                                    source == "carplay_route_loss_interruption",
+                                routeLostAtEpochMs = routeLostAt,
+                                reason = ContinuityDisconnectReason.CarPlayRouteLoss,
+                            ),
+                        )
+                    }
+                }
                 remoteCommandToPlayerAction(command, playerData.queueInfo)
-                    ?.let { action -> handleLocalCommand(playerData, action) }
+                    ?.let { action ->
+                        handleLocalCommand(
+                            playerData,
+                            action,
+                            explicitUserIntent = explicitUserIntent,
+                        )
+                    }
                     ?: log.w { "Unknown remote command: $command" }
             } ?: log.w { "No local player available for remote command: $command" }
         }
@@ -645,7 +760,7 @@ class LocalPlayerController(
     private fun pauseLocalIfPlaying() {
         localPlayerData.value?.let { playerData ->
             if (playerData.player.isPlaying) {
-                handleLocalCommand(playerData, PlayerAction.Pause)
+                handleLocalCommand(playerData, PlayerAction.Pause, explicitUserIntent = false)
             }
         }
     }
@@ -747,9 +862,13 @@ class LocalPlayerController(
         (newState?.queue as? DataState.Data)?.data?.info?.let { _optimisticQueueChanges.trySend(it) }
     }
 
-    private suspend fun enqueue(action: PlayerAction, request: Request) {
+    private suspend fun enqueue(
+        action: PlayerAction,
+        request: Request,
+        playbackIntentGeneration: Long?,
+    ) {
         commandQueueMutex.withLock {
-            val entry = QueuedEntry(action, request)
+            val entry = QueuedEntry(action, request, playbackIntentGeneration)
             when (action) {
                 PlayerAction.TogglePlayPause -> {
                     val idx = commandQueue.indexOfFirst { it.action is PlayerAction.TogglePlayPause }

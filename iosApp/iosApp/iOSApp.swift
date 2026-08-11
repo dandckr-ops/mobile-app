@@ -215,6 +215,11 @@ struct iOSApp: App {
         // `bootstrapKmp()` is idempotent, so the SwiftUI path's call from
         // `MainViewController()` is safe.
         MainViewControllerKt.bootstrapKmp()
+        if KmpHelper.shared.hasRouteLossHold() {
+            player.restoreRouteLossPlaybackBlock()
+        } else {
+            player.initializeRouteLossPlaybackSafety()
+        }
         KmpState.isReady = true
 
         // Second coordinator init phase: the now-playing channel observers

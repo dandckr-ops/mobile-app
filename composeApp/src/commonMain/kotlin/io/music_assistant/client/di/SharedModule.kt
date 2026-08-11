@@ -8,6 +8,8 @@ import io.music_assistant.client.auth.AuthCoordinator
 import io.music_assistant.client.auth.AuthenticationManager
 import io.music_assistant.client.connection.ConnectionManager
 import io.music_assistant.client.data.CarDspApplier
+import io.music_assistant.client.data.CarPlayContinuityCoordinator
+import io.music_assistant.client.data.LocalPlaybackIntentLane
 import io.music_assistant.client.data.LocalPlayerController
 import io.music_assistant.client.data.MainDataSource
 import io.music_assistant.client.data.PlayerPositionTracker
@@ -62,6 +64,8 @@ fun sharedModule(
         singleOf(::ImageCacheInvalidator)
         singleOf(serviceClientConstructor) { bind<ServiceClient>() }
         singleOf(::LogSharer)
+        singleOf(::CarPlayContinuityCoordinator)
+        singleOf(::LocalPlaybackIntentLane)
         single(createdAtStart = true) {
             ConnectionManager(
                 get(),
@@ -70,6 +74,7 @@ fun sharedModule(
         }
         single(createdAtStart = true) {
             AuthenticationManager(
+                get(),
                 get(),
                 get(),
             )

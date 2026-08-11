@@ -2,6 +2,7 @@ import Foundation
 import CarPlay
 import ComposeApp
 import os.log
+import AVFoundation
 
 /// CarPlay lifecycle markers. Logged at `.default` so they survive a
 /// post-drive sysdiagnose (`.info`/`.debug` are in-memory only).
@@ -136,6 +137,7 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         libraryTemplate = nil
         libraryBrowseSection = nil
         self.interfaceController = nil
+        KmpHelper.shared.onCarPlayDisconnected()
         if didAttachExternalConsumer {
             KmpHelper.shared.onExternalConsumerInactive()
             didAttachExternalConsumer = false
@@ -161,6 +163,17 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         }
 
         if !wasReady && ready {
+            let gen = connectionGen
+            KmpHelper.shared.onCarPlayConnected { [weak self] ticket in
+                guard let self = self, self.connectionGen == gen,
+                      self.interfaceController != nil, let ticket = ticket else { return }
+                let audioSession = AVAudioSession.sharedInstance()
+                KmpHelper.shared.confirmCarPlayContinuity(
+                    ticket: ticket.int64Value,
+                    routeAvailable: audioSession.currentRoute.outputs.contains { $0.portType == .carAudio },
+                    otherAudioOwner: audioSession.secondaryAudioShouldBeSilencedHint
+                )
+            }
             // Reconnected — re-fire the Library fetch. Drilldowns re-fetch
             // when re-entered, so only the top-level needs refreshing.
             refreshLibraryOnReconnect()

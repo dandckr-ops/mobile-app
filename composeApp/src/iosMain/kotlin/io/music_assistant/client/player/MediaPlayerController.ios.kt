@@ -16,7 +16,7 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
     private val log = Logger.withTag("MediaPlayerController")
 
     // Callback for remote commands from Control Center
-    actual var onRemoteCommand: ((String) -> Unit)? = null
+    actual var onRemoteCommand: ((String, String, Boolean) -> Unit)? = null
 
     // Sendspin streaming methods
     actual fun prepareStream(
@@ -33,9 +33,9 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
 
             // Set up remote command handler for iOS-originated commands
             player.setRemoteCommandHandler(object : RemoteCommandHandler {
-                override fun onCommand(command: String, source: String) {
-                    log.i { "iOS command [$source]: $command" }
-                    onRemoteCommand?.invoke(command)
+                override fun onCommand(command: String, source: String, explicitUserIntent: Boolean) {
+                    log.i { "iOS command [$source user=$explicitUserIntent]: $command" }
+                    onRemoteCommand?.invoke(command, source, explicitUserIntent)
                 }
             })
         } else {
@@ -58,8 +58,17 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
 
     actual fun resume() {
         resumeSink()
-        onRemoteCommand?.invoke("play")
+        onRemoteCommand?.invoke("play", "transport_reconnect", false)
     }
+
+    actual fun allowPlaybackAfterUserIntent(): Long =
+        PlatformPlayerProvider.player?.allowPlaybackAfterUserIntent() ?: -1L
+
+    actual fun authorizeVerifiedContinuityPlayback(): Long =
+        PlatformPlayerProvider.player?.authorizeVerifiedContinuityPlayback() ?: -1L
+
+    actual fun isPlaybackBlockedByRouteLoss(): Boolean =
+        PlatformPlayerProvider.player?.isRouteLossPlaybackBlocked() ?: true
 
     actual fun stopRawPcmStream() {
         PlatformPlayerProvider.player?.stopRawPcmStream()
