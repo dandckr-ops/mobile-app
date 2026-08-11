@@ -616,7 +616,7 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
         playbackGateLock.lock()
         pausedByInterruption = false // Stream stopped — no auto-resume on .ended.
         playbackGateLock.unlock()
-        AudioSessionCoordinator.shared.deactivatePlayback()
+        NowPlayingCoordinator.shared.deactivatePlayback()
     }
     /// `AudioQueueStop(_, true)` discards enqueued hardware buffers, so a rebuilt
     /// queue never replays stale audio. Leaves `pausedByInterruption` untouched —

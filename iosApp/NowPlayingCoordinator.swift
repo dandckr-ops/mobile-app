@@ -393,6 +393,21 @@ final class NowPlayingCoordinator {
         }
     }
 
+    /// Relinquish audio focus after local playback has fully stopped. Queue
+    /// lifecycle serialization ensures a newer playback start cannot be
+    /// overtaken by this deactivation.
+    func deactivatePlayback() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+            logInfo("Playback deactivated")
+        } catch {
+            logError("Failed to deactivate playback: \(error)")
+        }
+    }
+
     // MARK: - Remote commands
 
     /// Sets the handler for remote commands
