@@ -132,6 +132,11 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+        <provider
+            android:name=".auto.AndroidAutoArtworkProvider"
+            android:authorities="${applicationId}.autoartwork"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 
 </manifest>

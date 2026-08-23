@@ -13,6 +13,7 @@ import android.support.v4.media.session.PlaybackStateCompat
 import androidx.media.MediaBrowserServiceCompat
 import androidx.media.utils.MediaConstants
 import io.music_assistant.client.R
+import io.music_assistant.client.auto.AndroidAutoArtwork
 import io.music_assistant.client.auto.AutoLibrary
 import io.music_assistant.client.auto.MediaIds
 import io.music_assistant.client.auto.androidAutoLog
@@ -50,6 +51,7 @@ class AndroidAutoPlaybackService : MediaBrowserServiceCompat() {
     // Promoted only once a real media host (not SystemUI's notification rendering) binds.
     // Until then this service is a passive browse/lifetime holder of the shared session.
     private var promotedToHost = false
+    private val artworkClients = mutableSetOf<String>()
 
     override fun onCreate() {
         super.onCreate()
@@ -159,6 +161,11 @@ class AndroidAutoPlaybackService : MediaBrowserServiceCompat() {
     // SharedMediaSessionManager deactivates the session so no card is offered to the car.
     override fun onGetRoot(packageName: String, uID: Int, hints: Bundle?): BrowserRoot {
         androidAutoLog.i { "onGetRoot from package=$packageName uid=$uID" }
+        if (AndroidAutoArtwork.grantReadAccess(this, packageName, uID)) {
+            artworkClients += packageName
+        } else {
+            androidAutoLog.w { "Rejected artwork URI grant for package=$packageName uid=$uID" }
+        }
         promoteIfRealHost(packageName)
         val extras = Bundle().apply {
             putBoolean(MediaConstants.BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED, true)
@@ -270,6 +277,8 @@ class AndroidAutoPlaybackService : MediaBrowserServiceCompat() {
             sharedSession.unbindAutoHost()
         }
         sharedSession.release()
+        artworkClients.forEach { AndroidAutoArtwork.revokeReadAccess(this, it) }
+        artworkClients.clear()
         scope.cancel()
         super.onDestroy()
     }

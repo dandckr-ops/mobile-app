@@ -168,6 +168,10 @@ Android foreground services integrate with Sendspin through MainDataSource:
 - When Sendspin is playing locally, it appears in Android Auto
 - Supports library browsing via `AutoLibrary`
 - All actions go through `MainDataSource.playerAction()` and `queueAction()`
+- Publishes artwork as opaque, read-only `content://` URIs through
+  `AndroidAutoArtworkProvider`. The provider fetches and downsamples remote artwork under
+  the Music Assistant UID, so media hosts excluded from the app's VPN can still render it
+  without placing bitmaps in Binder browse transactions.
 
 **Key Pattern**: Services do NOT create or manage Sendspin directly. They access player data through MainDataSource's playersData StateFlow, maintaining a single source of truth.
 

@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import io.music_assistant.client.auto.AndroidAutoArtwork
 import io.music_assistant.client.di.androidModule
 import io.music_assistant.client.di.appModule
 import io.music_assistant.client.di.cleanupSingletons
@@ -18,6 +19,7 @@ import java.io.File
 class MyApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        AndroidAutoArtwork.initialize(this)
         val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         initKoin(androidModule(), appModule(), verboseLogging = debuggable) {
             androidContext(this@MyApplication)

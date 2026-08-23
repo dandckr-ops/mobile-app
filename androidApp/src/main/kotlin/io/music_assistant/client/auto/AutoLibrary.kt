@@ -995,6 +995,7 @@ fun AppMediaItem.toMediaDescription(
     defaultIconUri: Uri,
     category: String? = null,
     parentUri: String? = null,
+    artworkUri: (String) -> Uri? = AndroidAutoArtwork::uriFor,
 ): MediaDescriptionCompat {
     return MediaDescriptionCompat.Builder()
         .setMediaId("${itemId}__${uri}__${mediaType}__$provider")
@@ -1002,7 +1003,7 @@ fun AppMediaItem.toMediaDescription(
         .setSubtitle(subtitle)
         .setMediaUri(uri?.let { Uri.parse(it) })
         .setIconUri(
-            image(ImageType.THUMB)?.url?.let { Uri.parse(it) }
+            image(ImageType.THUMB)?.url?.let(artworkUri)
             ?: defaultIconUri,
         )
         .setExtras(
